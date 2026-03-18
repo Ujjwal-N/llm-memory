@@ -7,7 +7,7 @@ authors = [
     { name = "Ujjwal-N", email = "ujjwal.nadhani@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = ["fastmcp"]
+dependencies = ["fastmcp", "python-frontmatter"]
 
 [build-system]
 requires = ["uv_build>=0.10.11,<0.11.0"]
