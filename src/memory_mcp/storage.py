@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 import frontmatter
@@ -44,8 +45,8 @@ class Behavior(StrEnum):
 
 
 @dataclass(frozen=True)
-class SectionConfig:
-    """Rules for a top-level memory section."""
+class DirConfig:
+    """Configuration for a memory directory (top-level section or nested)."""
 
     behavior: Behavior
     description: str
@@ -53,24 +54,30 @@ class SectionConfig:
     valid_files: frozenset[str] | None = None  # required for fixed behavior
 
 
-DEFAULT_SECTIONS: dict[str, SectionConfig] = {
-    DIR_ME: SectionConfig(
+class PathResult(TypedDict):
+    """Return type for mutation operations that confirm the affected path."""
+
+    path: str
+
+
+DEFAULT_SECTIONS: dict[str, DirConfig] = {
+    DIR_ME: DirConfig(
         behavior=Behavior.FIXED,
         description="Fixed set of living documents: now, about, conventions, goals.",
         valid_files=frozenset(("now", "about", "conventions", "goals")),
     ),
-    DIR_DAILY: SectionConfig(
+    DIR_DAILY: DirConfig(
         behavior=Behavior.LOG,
         description="Append-only daily logs, one file per day.",
         extra_frontmatter=("date",),
     ),
-    DIR_PROJECTS: SectionConfig(
+    DIR_PROJECTS: DirConfig(
         behavior=Behavior.TREE,
         description="Free-form project hierarchy with arbitrary nesting.",
     ),
 }
 
-_sections: dict[str, SectionConfig] = dict(DEFAULT_SECTIONS)
+_bootstrap: dict[str, DirConfig] = dict(DEFAULT_SECTIONS)
 
 # Regex for extracting wikilinks
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
@@ -81,8 +88,8 @@ _VALID_BEHAVIORS: frozenset[str] = frozenset(Behavior)
 # --- Section loading ---
 
 
-def _parse_sections_json(raw: str) -> dict[str, SectionConfig]:
-    """Parse MEMORY_SECTIONS JSON into SectionConfig objects.
+def _parse_sections_json(raw: str) -> dict[str, DirConfig]:
+    """Parse MEMORY_SECTIONS JSON into DirConfig objects.
 
     Expected format: {"name": {"behavior": "tree", "description": "...", ...}}
     Only behavior and description are required; other fields have defaults per behavior.
@@ -95,7 +102,7 @@ def _parse_sections_json(raw: str) -> dict[str, SectionConfig]:
     if not isinstance(data, dict):
         raise ValueError("MEMORY_SECTIONS must be a JSON object")
 
-    sections: dict[str, SectionConfig] = {}
+    sections: dict[str, DirConfig] = {}
     for name, cfg in data.items():
         if not isinstance(cfg, dict):
             raise ValueError(f"Section '{name}' must be a JSON object")
@@ -143,7 +150,7 @@ def _parse_sections_json(raw: str) -> dict[str, SectionConfig]:
         if behavior == Behavior.LOG and "date" not in extra:
             extra = ("date", *extra)
 
-        sections[name] = SectionConfig(
+        sections[name] = DirConfig(
             behavior=Behavior(behavior),
             description=description,
             extra_frontmatter=extra,
@@ -153,7 +160,7 @@ def _parse_sections_json(raw: str) -> dict[str, SectionConfig]:
     return sections
 
 
-def load_sections() -> dict[str, SectionConfig]:
+def load_sections() -> dict[str, DirConfig]:
     """Load sections from DEFAULT_SECTIONS + MEMORY_SECTIONS env var.
 
     Returns DEFAULT_SECTIONS merged with any custom sections from the env var.
@@ -165,37 +172,10 @@ def load_sections() -> dict[str, SectionConfig]:
     return DEFAULT_SECTIONS | custom
 
 
-def apply_sections(sections: dict[str, SectionConfig]) -> None:
-    """Update module-level _sections dict in-place."""
-    _sections.clear()
-    _sections.update(sections)
-
-
-# --- Section guide ---
-
-
-def _describe_one(name: str, config: SectionConfig) -> dict:
-    """Build the guide dict for a single section."""
-    result: dict = {
-        "name": name,
-        "behavior": str(config.behavior),
-        "description": config.description,
-    }
-    if config.valid_files:
-        result["valid_files"] = sorted(f"{name}/{f}" for f in config.valid_files)
-    return result
-
-
-def describe_section(section: str | None = None) -> list[dict] | dict:
-    """Return section guide(s). No arg = all sections. With arg = single section."""
-    if section is None:
-        return [_describe_one(name, cfg) for name, cfg in _sections.items()]
-    config = _sections.get(section)
-    if config is None:
-        raise ValueError(
-            f"Unknown section: '{section}'. Available: {', '.join(_sections)}"
-        )
-    return _describe_one(section, config)
+def apply_sections(sections: dict[str, DirConfig]) -> None:
+    """Update module-level _bootstrap dict in-place."""
+    _bootstrap.clear()
+    _bootstrap.update(sections)
 
 
 # --- Path wrapper ---
@@ -205,38 +185,104 @@ def describe_section(section: str | None = None) -> list[dict] | dict:
 class MemoryPath:
     """A validated, section-prefixed path in the memory directory.
 
-    Always has the form "{section}/{subpath}" where section is one of
-    the configured top-level directories.
+    File paths end with .md: "me/now.md", "projects/acme/notes.md"
+    Directory paths end with /: "projects/", "projects/acme/"
+    Anything else is rejected.
+
+    API uses factory methods and fluent validation:
+    - parse_file(path) / parse_dir(path): parse + type-check in one step (preferred)
+    - parse(path): parse without type constraint (internal use)
+    - ensure_file() / ensure_dir(): fluent type guards, return self for chaining
+    - resolve_file(root) / resolve_dir(root): convert to absolute filesystem Path
+
+    Direct construction MemoryPath(section, subpath) is for internal code with known-good parts.
     """
 
     section: str
     subpath: str
+    is_dir: bool = False
+
+    def __post_init__(self) -> None:
+        if self.is_dir and self.subpath.endswith(".md"):
+            raise ValueError(f"Directory path has .md subpath: {self.subpath}")
+        if not self.is_dir and not self.subpath.endswith(".md"):
+            raise ValueError(f"File path must have .md subpath: {self.subpath}")
 
     def __str__(self) -> str:
-        return f"{self.section}/{self.subpath}"
+        base = f"{self.section}/{self.subpath}" if self.subpath else self.section
+        return f"{base}/" if self.is_dir else base
+
+    @staticmethod
+    def _validate_section(section: str, path: str) -> None:
+        """Raise if section is not in _bootstrap."""
+        if section not in _bootstrap:
+            raise ValueError(
+                f"Path must start with a known section "
+                f"({', '.join(_bootstrap)}). Got: {path!r}"
+            )
 
     @classmethod
     def parse(cls, path: str) -> "MemoryPath":
-        """Parse a section-prefixed path string like 'me/now' or 'projects/acme/features'."""
-        parts = path.split("/", 1)
-        if len(parts) < 2 or not parts[1]:
-            raise ValueError(f"Path must be {{section}}/{{subpath}}. Got: {path}")
-        if parts[0] not in _sections:
+        """Parse a path. Must end with .md (file) or / (directory)."""
+        if path.endswith("/"):
+            clean = path.rstrip("/")
+            parts = clean.split("/", 1)
+            section = parts[0]
+            subpath = parts[1] if len(parts) > 1 else ""
+            cls._validate_section(section, path)
+            return cls(section=section, subpath=subpath, is_dir=True)
+
+        if path.endswith(".md"):
+            parts = path.split("/", 1)
+            section = parts[0]
+            subpath = parts[1] if len(parts) > 1 else ""
+            cls._validate_section(section, path)
+            if not subpath:
+                raise ValueError(f"File path must include a subpath. Got: {path!r}")
+            return cls(section=section, subpath=subpath, is_dir=False)
+
+        raise ValueError(
+            f"Path must end with .md (file) or / (directory). Got: {path!r}"
+        )
+
+    @classmethod
+    def parse_file(cls, path: str) -> "MemoryPath":
+        """Parse and validate as a file path (must end with .md)."""
+        return cls.parse(path).ensure_file()
+
+    @classmethod
+    def parse_dir(cls, path: str) -> "MemoryPath":
+        """Parse and validate as a directory path (must end with /)."""
+        return cls.parse(path).ensure_dir()
+
+    def ensure_file(self) -> "MemoryPath":
+        """Validate this is a file path. Returns self for chaining."""
+        if self.is_dir:
             raise ValueError(
-                f"Path must start with {', '.join(_sections)}/. Got: {path}"
+                f"Expected a file path (ending in .md), got directory: {self}"
             )
-        return cls(section=parts[0], subpath=parts[1])
+        return self
+
+    def ensure_dir(self) -> "MemoryPath":
+        """Validate this is a directory path. Returns self for chaining."""
+        if not self.is_dir:
+            raise ValueError(
+                f"Expected a directory path (trailing /), got file: {self}"
+            )
+        return self
 
     def resolve_file(self, root: Path) -> Path:
-        """Resolve to an absolute .md file path within root, preventing directory traversal."""
-        full = (root / f"{self}{FILE_EXT}").resolve()
+        """Resolve to an absolute file path. Rejects directory paths."""
+        self.ensure_file()
+        full = (root / self.section / self.subpath).resolve()
         if not full.is_relative_to(root):
             raise ValueError(f"Path escapes memory directory: {self}")
         return full
 
     def resolve_dir(self, root: Path) -> Path:
-        """Resolve to an absolute directory path within root, preventing directory traversal."""
-        full = (root / str(self)).resolve()
+        """Resolve to an absolute directory path. Rejects file paths."""
+        self.ensure_dir()
+        full = (root / self.section / self.subpath).resolve()
         if not full.is_relative_to(root):
             raise ValueError(f"Path escapes memory directory: {self}")
         return full
@@ -274,15 +320,11 @@ _FRONTMATTER_HANDLERS: dict[str, FrontmatterHandler] = {
 }
 
 
-def _stamp_metadata(text: str, section: str) -> str:
-    """Apply frontmatter fields from BASE_FRONTMATTER + section's extra_frontmatter.
+def _stamp_metadata(text: str, config: DirConfig) -> str:
+    """Apply frontmatter fields from BASE_FRONTMATTER + config's extra_frontmatter.
 
     Each field is resolved via _FRONTMATTER_HANDLERS registry.
     """
-    config = _sections.get(section)
-    if config is None:
-        return text
-
     post = frontmatter.loads(text)
     today = datetime.now(tz=_TZ).strftime("%Y-%m-%d")
 
@@ -290,6 +332,52 @@ def _stamp_metadata(text: str, section: str) -> str:
         _FRONTMATTER_HANDLERS[field](post, today)
 
     return frontmatter.dumps(post)
+
+
+# --- Directory config I/O ---
+
+
+def read_dir_config(index_path: Path) -> DirConfig | None:
+    """Read DirConfig from an _index.md file's frontmatter.
+
+    Returns None if the file doesn't exist or has no 'behavior' field.
+    Only returns a DirConfig when behavior is explicitly declared.
+    """
+    if not index_path.is_file():
+        return None
+    post = frontmatter.loads(index_path.read_text())
+    behavior_raw = post.metadata.get("behavior")
+    if behavior_raw not in _VALID_BEHAVIORS:
+        return None
+    description = str(post.metadata.get("description", ""))
+    extra_fm_raw = post.metadata.get("extra_frontmatter")
+    extra_fm = tuple(extra_fm_raw) if isinstance(extra_fm_raw, list) else ()
+    valid_files_raw = post.metadata.get("valid_files")
+    valid_files = (
+        frozenset(valid_files_raw) if isinstance(valid_files_raw, list) else None
+    )
+    return DirConfig(
+        behavior=Behavior(str(behavior_raw)),
+        description=description,
+        extra_frontmatter=extra_fm,
+        valid_files=valid_files,
+    )
+
+
+def write_dir_config(index_path: Path, config: DirConfig, content: str) -> None:
+    """Write _index.md with DirConfig fields in frontmatter.
+
+    Stamps config fields (behavior, description, etc.) into frontmatter
+    and writes the provided content as the markdown body.
+    """
+    post = frontmatter.loads(content)
+    post["behavior"] = str(config.behavior)
+    post["description"] = config.description
+    if config.extra_frontmatter:
+        post["extra_frontmatter"] = list(config.extra_frontmatter)
+    if config.valid_files:
+        post["valid_files"] = sorted(config.valid_files)
+    index_path.write_text(frontmatter.dumps(post))
 
 
 # --- Core path utilities ---
@@ -306,9 +394,9 @@ def get_root() -> Path:
 # --- Init ---
 
 
-def _seed_file(path: Path, title: str, section: str) -> None:
+def _seed_file(path: Path, title: str, config: DirConfig) -> None:
     """Write a starter markdown file with a heading and stamped frontmatter."""
-    content = _stamp_metadata(f"# {title}\n", section)
+    content = _stamp_metadata(f"# {title}\n", config)
     path.write_text(content)
 
 
@@ -329,24 +417,24 @@ def init_memory_dir(root: Path) -> dict:
 
     created: list[str] = []
 
-    for d in _sections:
+    for d in _bootstrap:
         target = root / d
         if not target.exists():
             target.mkdir(parents=True)
             created.append(d)
 
     created_files: list[str] = []
-    for section_name, config in _sections.items():
+    for section, config in _bootstrap.items():
         if config.behavior == Behavior.FIXED and not config.valid_files:
             raise SystemExit(
-                f"Section '{section_name}' has fixed behavior but no valid_files."
+                f"Section '{section}' has fixed behavior but no valid_files."
             )
         if config.behavior == Behavior.FIXED and config.valid_files:
             for page in sorted(config.valid_files):
-                mp = MemoryPath(section_name, page)
+                mp = MemoryPath(section, f"{page}.md")
                 target = mp.resolve_file(root)
                 if not target.exists():
-                    _seed_file(target, page.title(), section_name)
+                    _seed_file(target, page.title(), config)
                     created_files.append(str(mp))
 
     return {
@@ -360,197 +448,188 @@ def init_memory_dir(root: Path) -> dict:
 
 
 def read_file(root: Path, path: str) -> str:
-    """Read a markdown file by section-prefixed path (without .md extension).
-
-    For directory paths, reads _index.md within that directory.
-    """
-    mp = MemoryPath.parse(path)
+    """Read a markdown file by its full path (e.g. "me/now.md")."""
+    mp = MemoryPath.parse_file(path)
     target = mp.resolve_file(root)
 
-    if target.is_file():
-        return target.read_text()
-
-    index = target.with_suffix("") / INDEX_FILE
-    if index.is_file():
-        return index.read_text()
-
-    raise ValueError(f"File not found: {mp}{FILE_EXT} (also checked {mp}/{INDEX_FILE})")
+    if not target.is_file():
+        raise ValueError(f"File not found: {mp}")
+    return target.read_text()
 
 
 # --- Scan ---
 
 
 def _file_modified(path: Path) -> str:
-    """Return last-modified timestamp for a file."""
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+    """Return last-modified UTC timestamp for a file."""
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
 
 
-def _scan_tree(directory: Path, base_path: str) -> list[dict]:
+def _scan_tree(directory: Path, section: str, rel_path: str = "") -> list[dict]:
     """Recursively build a tree of files and subdirectories.
 
-    base_path is the full path to this directory (e.g. "projects/acme").
+    section is the top-level section name (e.g. "projects").
+    rel_path is the path within the section (e.g. "acme/v2"), empty for section root.
     """
     entries: list[dict] = []
     for child in sorted(directory.iterdir()):
         if child.name.startswith("."):
             continue
+        child_rel = f"{rel_path}/{child.name}" if rel_path else child.name
         if child.is_dir():
-            child_path = f"{base_path}/{child.name}"
+            mp = MemoryPath(section, child_rel, is_dir=True)
             entries.append(
                 {
-                    "type": "directory",
-                    "path": child_path,
-                    "children": _scan_tree(child, child_path),
+                    "path": str(mp),
+                    "children": _scan_tree(child, section, child_rel),
                 }
             )
         elif child.suffix == FILE_EXT:
+            mp = MemoryPath(section, child_rel)
             entries.append(
                 {
-                    "type": "file",
-                    "path": f"{base_path}/{child.stem}",
+                    "path": str(mp),
                     "modified": _file_modified(child),
                 }
             )
     return entries
 
 
-def _scan_fixed(directory: Path, section_name: str) -> list[dict]:
+def _scan_fixed(directory: Path, section: str) -> list[dict]:
     """Scan a fixed-behavior section: flat file list."""
     if not directory.is_dir():
         return []
     return [
-        {"path": f"{section_name}/{f.stem}", "modified": _file_modified(f)}
+        {
+            "path": str(MemoryPath(section, f.name)),
+            "modified": _file_modified(f),
+        }
         for f in sorted(directory.glob(MD_PATTERN))
     ]
 
 
-def _scan_log(directory: Path, section_name: str, limit: int = 20) -> list[dict]:
+def _scan_log(directory: Path, section: str, limit: int = 20) -> list[dict]:
     """Scan a log-behavior section: most recent N files, reverse sorted."""
     if not directory.is_dir():
         return []
     return [
-        {"path": f"{section_name}/{f.stem}", "modified": _file_modified(f)}
+        {
+            "path": str(MemoryPath(section, f.name)),
+            "modified": _file_modified(f),
+        }
         for f in sorted(directory.glob(MD_PATTERN), reverse=True)[:limit]
     ]
 
 
-def _scan_section(
-    directory: Path, section_name: str, config: SectionConfig
-) -> list[dict]:
+def _scan_section(directory: Path, section: str, config: DirConfig) -> list[dict]:
     """Dispatch to the appropriate scanner based on section behavior."""
     if not directory.is_dir():
         return []
     if config.behavior == Behavior.FIXED:
-        return _scan_fixed(directory, section_name)
+        return _scan_fixed(directory, section)
     if config.behavior == Behavior.LOG:
-        return _scan_log(directory, section_name)
-    return _scan_tree(directory, section_name)
+        return _scan_log(directory, section)
+    return _scan_tree(directory, section)
 
 
-def scan_schema(root: Path, sub_path: str | None = None) -> dict:
+def scan_schema(root: Path, path: str | None = None) -> dict:
     """Walk the memory directory and return a structured schema.
 
-    Every file entry includes a full path usable with read_file and a modified timestamp.
-    Tree sections additionally include type (file/directory) and nested children.
-    If sub_path is given, scans only that subdirectory.
+    File entries: {path (ends with .md), modified}.
+    Directory entries: {path (ends with /), children}.
+    Path suffixes are self-describing: .md = file, / = directory.
+    If path is given (must end with /), scans only that directory.
     """
-    if sub_path:
-        # Bare section name (e.g. "projects") — scan entire section
-        if "/" not in sub_path:
-            if sub_path not in _sections:
-                raise ValueError(
-                    f"Unknown section: '{sub_path}'. Available: {', '.join(_sections)}"
-                )
-            section_dir = root / sub_path
-            config = _sections[sub_path]
-            return {
-                "path": sub_path,
-                "entries": _scan_section(section_dir, sub_path, config),
-            }
+    if path is None:
+        result: dict = {}
+        for section, config in _bootstrap.items():
+            key = str(MemoryPath(section, "", is_dir=True))
+            result[key] = _scan_section(root / section, section, config)
+        return result
 
-        # Subdirectory scan (e.g. "projects/acme")
-        mp = MemoryPath.parse(sub_path)
-        target = mp.resolve_dir(root)
-        if not target.is_dir():
-            raise ValueError(f"Not a directory: {mp}")
-        return {"path": str(mp), "tree": _scan_tree(target, str(mp))}
+    mp = MemoryPath.parse_dir(path)
+    target = mp.resolve_dir(root)
+    config = _bootstrap[mp.section]
 
-    result: dict = {}
-    for section_name, config in _sections.items():
-        result[section_name] = _scan_section(root / section_name, section_name, config)
-    return result
+    if not mp.subpath:
+        return {
+            "path": str(mp),
+            "entries": _scan_section(target, mp.section, config),
+        }
+
+    if not target.is_dir():
+        raise ValueError(f"Not a directory: {mp}")
+    return {"path": str(mp), "tree": _scan_tree(target, mp.section, mp.subpath)}
 
 
-def _check_behavior(section: str, expected: Behavior) -> None:
-    """Assert section has the expected behavior. Violation indicates a routing bug."""
-    config = _sections.get(section)
+def _check_behavior(section: str, expected: Behavior) -> DirConfig:
+    """Assert section has the expected behavior and return its config.
+
+    Raises RuntimeError on mismatch (indicates a routing bug in the server layer).
+    """
+    config = _bootstrap.get(section)
     if config is None or config.behavior != expected:
         actual = config.behavior if config else "unknown"
         raise RuntimeError(
             f"Internal error: '{section}' has behavior '{actual}', "
             f"expected {expected}. This is a bug in tool routing."
         )
+    return config
 
 
 # --- FIXED section (generic) ---
 
 
-def update_fixed_page(root: Path, path: str, content: str) -> dict:
+def update_fixed_page(root: Path, path: str, content: str) -> PathResult:
     """Update a page in a fixed-behavior section. Auto-stamps frontmatter."""
-    mp = MemoryPath.parse(path)
-    _check_behavior(mp.section, Behavior.FIXED)
-    config = _sections[mp.section]
-    if config.valid_files and mp.subpath not in config.valid_files:
-        valid = ", ".join(f"{mp.section}/{f}" for f in sorted(config.valid_files))
+    mp = MemoryPath.parse_file(path)
+    config = _check_behavior(mp.section, Behavior.FIXED)
+    stem = mp.subpath.removesuffix(".md")
+    if config.valid_files and stem not in config.valid_files:
+        valid = ", ".join(
+            str(MemoryPath(mp.section, f"{f}.md")) for f in sorted(config.valid_files)
+        )
         raise ValueError(f"Invalid page '{mp}'. Valid pages: {valid}.")
 
-    content = _stamp_metadata(content, mp.section)
+    content = _stamp_metadata(content, config)
     target = mp.resolve_file(root)
     target.write_text(content)
-    return {"path": str(mp), "full_content": target.read_text()}
+    return {"path": str(mp)}
 
 
 # --- LOG section (generic) ---
 
 
-def add_log_entry(root: Path, section: str, content: str) -> dict:
+def add_log_entry(root: Path, section: str, content: str) -> PathResult:
     """Append an entry to today's log in the given section."""
-    _check_behavior(section, Behavior.LOG)
+    config = _check_behavior(section, Behavior.LOG)
     date_str = datetime.now(tz=_TZ).strftime("%Y-%m-%d")
-    mp = MemoryPath(section, date_str)
+    mp = MemoryPath(section, f"{date_str}.md")
     target = mp.resolve_file(root)
-    target.parent.mkdir(exist_ok=True)
 
     if not target.exists():
-        _seed_file(target, date_str, section)
+        _seed_file(target, date_str, config)
 
     with target.open("a") as f:
         f.write(content)
 
     full_text = target.read_text()
-    full_text = _stamp_metadata(full_text, section)
+    full_text = _stamp_metadata(full_text, config)
     target.write_text(full_text)
 
-    return {
-        "path": str(mp),
-        "full_content": target.read_text(),
-    }
+    return {"path": str(mp)}
 
 
-def edit_log(root: Path, path: str, content: str) -> dict:
-    """Overwrite the full content of a log entry by full path."""
-    mp = MemoryPath.parse(path)
-    _check_behavior(mp.section, Behavior.LOG)
+def edit_log(root: Path, path: str, content: str) -> PathResult:
+    """Create or overwrite a log entry by full path. Use for corrections and backfilling."""
+    mp = MemoryPath.parse_file(path)
+    config = _check_behavior(mp.section, Behavior.LOG)
     target = mp.resolve_file(root)
-
-    if not target.is_file():
-        raise ValueError(
-            f"No log found at {mp}. Use add_log_entry to create a new one."
-        )
-
-    content = _stamp_metadata(content, mp.section)
+    content = _stamp_metadata(content, config)
     target.write_text(content)
-    return {"path": str(mp), "full_content": target.read_text()}
+    return {"path": str(mp)}
 
 
 # --- TREE section (generic) ---
@@ -559,19 +638,19 @@ def edit_log(root: Path, path: str, content: str) -> dict:
 def _check_parent_exists(parent: Path, section: str, root: Path) -> None:
     """Raise if a parent directory doesn't exist."""
     if not parent.exists():
-        parent_rel = parent.relative_to(root / section)
+        parent_rel = str(parent.relative_to(root / section))
+        mp = MemoryPath(section, parent_rel, is_dir=True)
         raise ValueError(
-            f"Directory does not exist: {section}/{parent_rel}. "
-            f"Use create_directory to create it first."
+            f"Directory does not exist: {mp}. Use create_directory to create it first."
         )
 
 
-def create_directory(root: Path, path: str) -> dict:
+def create_directory(root: Path, path: str) -> PathResult:
     """Create a directory in a tree-behavior section.
 
     Only creates one level — parent must already exist.
     """
-    mp = MemoryPath.parse(path)
+    mp = MemoryPath.parse_dir(path)
     _check_behavior(mp.section, Behavior.TREE)
     target = mp.resolve_dir(root)
 
@@ -583,33 +662,28 @@ def create_directory(root: Path, path: str) -> dict:
     return {"path": str(mp)}
 
 
-def write_tree_file(root: Path, path: str, content: str) -> dict:
+def write_tree_file(root: Path, path: str, content: str) -> PathResult:
     """Create or overwrite a file in a tree-behavior section.
 
     Parent directory must already exist — use create_directory first.
     """
-    mp = MemoryPath.parse(path)
-    _check_behavior(mp.section, Behavior.TREE)
+    mp = MemoryPath.parse_file(path)
+    config = _check_behavior(mp.section, Behavior.TREE)
     target = mp.resolve_file(root)
 
     _check_parent_exists(target.parent, mp.section, root)
 
-    content = _stamp_metadata(content, mp.section)
+    content = _stamp_metadata(content, config)
     target.write_text(content)
-
-    return {
-        "path": str(mp),
-        "full_content": target.read_text(),
-    }
+    return {"path": str(mp)}
 
 
-def move_tree_file(root: Path, source: str, destination: str) -> dict:
+def move_tree_file(root: Path, source: str, destination: str) -> PathResult:
     """Move or rename a file within a tree-behavior section."""
-    src_mp = MemoryPath.parse(source)
+    src_mp = MemoryPath.parse_file(source)
     _check_behavior(src_mp.section, Behavior.TREE)
-    dst_mp = MemoryPath.parse(destination)
-    dst_config = _sections.get(dst_mp.section)
-    if dst_config is None or dst_config.behavior != Behavior.TREE:
+    dst_mp = MemoryPath.parse_file(destination)
+    if _bootstrap[dst_mp.section].behavior != Behavior.TREE:
         raise ValueError(
             f"Cannot move files into '{dst_mp.section}/' — only tree sections support moves."
         )
@@ -618,36 +692,29 @@ def move_tree_file(root: Path, source: str, destination: str) -> dict:
 
     if not src.is_file():
         raise ValueError(
-            f"Source not found: {src_mp}{FILE_EXT}. Use scan_schema to find valid paths."
+            f"Source not found: {src_mp}. Use scan_schema to find valid paths."
         )
     if dst.is_file():
-        raise ValueError(f"Destination already exists: {dst_mp}{FILE_EXT}")
+        raise ValueError(f"Destination already exists: {dst_mp}")
 
     _check_parent_exists(dst.parent, dst_mp.section, root)
     shutil.move(str(src), str(dst))
-
-    return {
-        "path": str(dst_mp),
-        "full_content": dst.read_text(),
-    }
+    return {"path": str(dst_mp)}
 
 
-def delete_file(root: Path, path: str) -> dict:
+def delete_file(root: Path, path: str) -> PathResult:
     """Delete a file in any non-fixed section.
 
     Refuses to delete _index.md if the directory still contains other files.
     Cleans up empty parent directories after deletion.
     """
-    mp = MemoryPath.parse(path)
-    config = _sections.get(mp.section)
-    if config is None or config.behavior == Behavior.FIXED:
-        raise ValueError(f"Cannot delete files in '{mp.section}' section.")
+    mp = MemoryPath.parse_file(path)
+    if _bootstrap[mp.section].behavior == Behavior.FIXED:
+        raise ValueError(f"Cannot delete files in '{mp.section}/' (fixed section).")
     target = mp.resolve_file(root)
 
     if not target.is_file():
-        raise ValueError(
-            f"File not found: {mp}{FILE_EXT}. Use scan_schema to find valid paths."
-        )
+        raise ValueError(f"File not found: {mp}. Use scan_schema to find valid paths.")
 
     if target.name == INDEX_FILE:
         siblings = [p for p in target.parent.iterdir() if p != target]

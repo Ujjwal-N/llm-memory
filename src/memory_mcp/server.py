@@ -1,4 +1,4 @@
-"""FastMCP server: instructions, tools, resources, and prompts for the memory layer."""
+"""FastMCP server: instructions and tools for the memory layer."""
 
 import functools
 from collections.abc import Callable
@@ -9,34 +9,9 @@ from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from memory_mcp import storage
+from memory_mcp.storage import PathResult
 
 _T = TypeVar("_T")
-
-_APPLICABLE_TOOLS: dict[storage.Behavior, list[str]] = {
-    storage.Behavior.FIXED: [
-        "read_file",
-        "write_file",
-        "scan_schema",
-        "describe_section",
-    ],
-    storage.Behavior.LOG: [
-        "read_file",
-        "add_log_entry",
-        "edit_log",
-        "delete_file",
-        "scan_schema",
-        "describe_section",
-    ],
-    storage.Behavior.TREE: [
-        "read_file",
-        "write_file",
-        "create_directory",
-        "move_file",
-        "delete_file",
-        "scan_schema",
-        "describe_section",
-    ],
-}
 
 
 def _tool_errors(fn: Callable[..., _T]) -> Callable[..., _T]:
@@ -54,32 +29,41 @@ def _tool_errors(fn: Callable[..., _T]) -> Callable[..., _T]:
 
 # --- Config loading (before tool registration) ---
 
-_sections = storage.load_sections()
-storage.apply_sections(_sections)
+_configs = storage.load_sections()
+storage.apply_sections(_configs)
 
 
 def _build_instructions() -> str:
-    """Generate INSTRUCTIONS from SectionConfig descriptions."""
+    """Generate INSTRUCTIONS from DirConfig descriptions."""
     section_lines: list[str] = []
-    for name, cfg in _sections.items():
-        section_lines.append(f"- {name}/ ({cfg.behavior})")
+    for name, cfg in _configs.items():
+        line = f"- {name}/ ({cfg.behavior}): {cfg.description}"
+        if cfg.valid_files:
+            valid = ", ".join(
+                str(storage.MemoryPath(name, f"{f}.md"))
+                for f in sorted(cfg.valid_files)
+            )
+            line += f" Valid files: {valid}."
+        section_lines.append(line)
     sections_block = "\n".join(section_lines)
 
     return f"""\
 You are connected to a personal memory layer stored as markdown files.
 
-PATHS: All paths use the format "section/subpath" (e.g. "me/now", "daily/2026-03-18", \
-"projects/demo/notes"). This format is used everywhere — tool inputs, return values, \
-scan_schema output, and read_file. Paths from one tool can be passed directly to another.
+PATHS: File paths end with .md, directory paths end with /. \
+Paths without .md or / are rejected. \
+Paths from one tool's output compose directly into another tool's input. \
+scan_schema and create_directory take directory paths (/). All other tools take file paths (.md).
 
-WORKFLOWS:
-- Before writing to a section for the first time: call describe_section to learn its \
-rules and applicable tools.
-- After any structural change (file creates, moves, deletes): call scan_schema to \
-refresh your map.
+BEHAVIORS:
+- fixed: read + write only. Files are predefined, cannot create/delete/move.
+- log: append today via add_log_entry, correct or backfill via edit_log. Can delete. Cannot move.
+- tree: full control. read, write, create_directory, move, delete.
 
 SECTIONS:
-{sections_block}\
+{sections_block}
+
+After any structural change, call scan_schema to refresh your map.\
 """
 
 
@@ -102,57 +86,24 @@ mcp = FastMCP("memory", instructions=INSTRUCTIONS)
 )
 @_tool_errors
 def scan_schema(path: str | None = None) -> dict:
-    """Scan the memory directory and return a structured schema of all files.
+    """Scan the memory directory and return a structured schema.
 
-    Each file entry has a path (usable with read_file) and a modified timestamp.
-    Tree sections also include type and nested children.
+    File entries: {path (ends with .md), modified}.
+    Directory entries: {path (ends with /), children}.
+    Path suffixes are self-describing: .md = file, / = directory.
 
     Use at session start to understand the full directory layout. Call again
     after any structural changes.
 
     Args:
-        path: Optional subdirectory to scope the scan (e.g. "projects/acme").
-              Omit to scan the entire memory directory.
+        path: Optional directory path to scope the scan (must end with /).
+              Examples: "projects/", "projects/acme/". Omit to scan everything.
 
     Returns:
-        Full scan: {me: [...], daily: [...], projects: <tree>, ...}
-        Scoped scan: {path: str, tree: [...]}
+        Full scan: {"me/": [...], "daily/": [...], "projects/": [...]}
+        Scoped scan: {path, entries: [...]} or {path, children: [...]}
     """
     return storage.scan_schema(storage.get_root(), path)
-
-
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Describe Section",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
-    )
-)
-@_tool_errors
-def describe_section(section: str | None = None) -> list[dict] | dict:
-    """Get info about a memory section before using it.
-
-    Call with no argument to list all sections.
-    Call with a section name to get its details and applicable tools.
-
-    Args:
-        section: Section name (e.g. "me", "daily", "projects"). Omit for all.
-
-    Returns:
-        Each entry: {name, behavior, description, applicable_tools, valid_files?}
-    """
-    result = storage.describe_section(section)
-
-    def _enrich(guide: dict) -> dict:
-        behavior = storage.Behavior(guide["behavior"])
-        guide["applicable_tools"] = _APPLICABLE_TOOLS[behavior]
-        return guide
-
-    if isinstance(result, list):
-        return [_enrich(g) for g in result]
-    return _enrich(result)
 
 
 @mcp.tool(
@@ -166,12 +117,12 @@ def describe_section(section: str | None = None) -> list[dict] | dict:
 )
 @_tool_errors
 def read_file(path: str) -> str:
-    """Read a file by path (without .md extension).
+    """Read a markdown file by path.
 
-    Works for any section. For directories, reads the _index.md within.
+    Works for any section. Path must end with .md.
 
     Args:
-        path: Full path (e.g. "me/now", "daily/2026-03-18", "projects/acme/notes").
+        path: File path (e.g. "me/now.md", "daily/2026-03-18.md", "projects/acme/notes.md").
 
     Returns:
         The full file content (including frontmatter) as a string.
@@ -189,7 +140,7 @@ def read_file(path: str) -> str:
     )
 )
 @_tool_errors
-def write_file(path: str, content: str) -> dict:
+def write_file(path: str, content: str) -> PathResult:
     """Create or overwrite a file. Works for tree and fixed sections.
 
     This OVERWRITES the entire file. To preserve existing content, read the file
@@ -199,14 +150,14 @@ def write_file(path: str, content: str) -> dict:
     For tree sections (projects/): parent directory must already exist.
 
     Args:
-        path: Full path (e.g. "me/now", "projects/acme/notes").
+        path: File path ending in .md (e.g. "me/now.md", "projects/acme/notes.md").
         content: The complete file content to write.
 
     Returns:
-        {path, full_content}
+        {path}
     """
-    mp = storage.MemoryPath.parse(path)
-    config = storage._sections[mp.section]
+    mp = storage.MemoryPath.parse_file(path)
+    config = storage._bootstrap[mp.section]
     if config.behavior == storage.Behavior.FIXED:
         return storage.update_fixed_page(storage.get_root(), path, content)
     if config.behavior == storage.Behavior.TREE:
@@ -227,14 +178,14 @@ def write_file(path: str, content: str) -> dict:
     )
 )
 @_tool_errors
-def create_directory(path: str) -> dict:
+def create_directory(path: str) -> PathResult:
     """Create a directory in a tree section.
 
     Only creates one level — parent directory must already exist.
     Build nested structures one level at a time.
 
     Args:
-        path: Full path (e.g. "projects/acme" or "projects/acme/v2").
+        path: Directory path with trailing / (e.g. "projects/acme/" or "projects/acme/v2/").
 
     Returns:
         {path}
@@ -252,18 +203,18 @@ def create_directory(path: str) -> dict:
     )
 )
 @_tool_errors
-def move_file(source: str, destination: str) -> dict:
+def move_file(source: str, destination: str) -> PathResult:
     """Move or rename a file within a tree section.
 
     Destination directory must already exist. Does NOT update [[wikilinks]]
     in other files — read affected files and update references manually.
 
     Args:
-        source: Full path (e.g. "projects/acme/old-name").
-        destination: Full path (e.g. "projects/acme/new-name").
+        source: File path (e.g. "projects/acme/old-name.md").
+        destination: File path (e.g. "projects/acme/new-name.md").
 
     Returns:
-        {path, full_content}
+        {path}
     """
     return storage.move_tree_file(storage.get_root(), source, destination)
 
@@ -278,13 +229,13 @@ def move_file(source: str, destination: str) -> dict:
     )
 )
 @_tool_errors
-def delete_file(path: str) -> dict:
+def delete_file(path: str) -> PathResult:
     """Delete a file in any non-fixed section (tree or log).
 
     Cleans up empty parent directories after deletion.
 
     Args:
-        path: Full path (e.g. "projects/acme/old-notes", "daily/2026-03-18").
+        path: File path (e.g. "projects/acme/old-notes.md", "daily/2026-03-18.md").
 
     Returns:
         {path}
@@ -302,7 +253,7 @@ def delete_file(path: str) -> dict:
     )
 )
 @_tool_errors
-def add_log_entry(section: str, content: str) -> dict:
+def add_log_entry(section: str, content: str) -> PathResult:
     """Append an entry to today's log in a log section.
 
     Creates today's log file if it doesn't exist. Content is appended as-is —
@@ -313,7 +264,7 @@ def add_log_entry(section: str, content: str) -> dict:
         content: The content to append.
 
     Returns:
-        {path, full_content}
+        {path}
     """
     return storage.add_log_entry(storage.get_root(), section, content)
 
@@ -328,19 +279,18 @@ def add_log_entry(section: str, content: str) -> dict:
     )
 )
 @_tool_errors
-def edit_log(path: str, content: str) -> dict:
-    """Overwrite the full content of a log entry for corrections.
+def edit_log(path: str, content: str) -> PathResult:
+    """Create or overwrite a log entry. Use for corrections and backfilling past dates.
 
-    Read the log first, make your changes, then write back the complete content.
-    Only use this to correct or reorganize existing entries — use add_log_entry
-    for new entries.
+    For today's log, prefer add_log_entry (appends). Use edit_log to write
+    complete content for any date — past or present.
 
     Args:
-        path: Full path (e.g. "daily/2026-03-18").
+        path: File path (e.g. "daily/2026-03-18.md").
         content: The complete file content.
 
     Returns:
-        {path, full_content}
+        {path}
     """
     return storage.edit_log(storage.get_root(), path, content)
 
