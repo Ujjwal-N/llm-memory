@@ -53,8 +53,8 @@ class TestScanSchemaScoped:
         storage.write_tree_file(root, "projects/acme/notes.md", "# Notes")
         result = storage.scan_schema(root, "projects/acme/")
         assert result["path"] == "projects/acme/"
-        assert "tree" in result
-        paths = [e["path"] for e in result["tree"]]
+        assert "children" in result
+        paths = [e["path"] for e in result["children"]]
         assert "projects/acme/notes.md" in paths
 
     def test_rejects_file_path(self, root: Path) -> None:

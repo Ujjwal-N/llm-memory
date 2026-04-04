@@ -25,7 +25,7 @@ class TestUpdateFixedPage:
             storage.update_fixed_page(root, "me/invalid.md", "content")
 
     def test_rejects_wrong_behavior(self, root: Path) -> None:
-        with pytest.raises(RuntimeError, match="bug in tool routing"):
+        with pytest.raises(ValueError, match="requires a fixed section"):
             storage.update_fixed_page(root, "projects/file.md", "content")
 
     def test_wikilinks_extracted(self, root: Path) -> None:

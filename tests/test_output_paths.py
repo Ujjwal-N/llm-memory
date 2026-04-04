@@ -109,6 +109,11 @@ class TestMutationOutputPaths:
         result = storage.edit_log(root, entry["path"], "# New")
         assert result["path"].endswith(".md")
 
+    def test_edit_file_path(self, root: Path) -> None:
+        storage.write_tree_file(root, "projects/notes.md", "# Notes\nBody")
+        result = storage.edit_file(root, "projects/notes.md", "Body", "Edited")
+        assert result["path"].endswith(".md")
+
     def test_init_memory_dir_seeded_files(self, root: Path) -> None:
         result = storage.init_memory_dir(root)
         for f in result["seeded_files"]:

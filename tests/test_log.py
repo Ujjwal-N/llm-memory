@@ -28,7 +28,7 @@ class TestAddLogEntry:
         assert "date:" in content
 
     def test_rejects_wrong_behavior(self, root: Path) -> None:
-        with pytest.raises(RuntimeError, match="bug in tool routing"):
+        with pytest.raises(ValueError, match="requires a log section"):
             storage.add_log_entry(root, "projects", "content")
 
     def test_path_is_valid_memory_path(self, root: Path) -> None:
@@ -48,12 +48,14 @@ class TestEditLog:
         assert "old content" not in content
 
     def test_backfill_creates_file(self, root: Path) -> None:
-        result = storage.edit_log(root, "daily/2000-01-01.md", "# Backfilled\nDid stuff")
+        result = storage.edit_log(
+            root, "daily/2000-01-01.md", "# Backfilled\nDid stuff"
+        )
         assert result["path"] == "daily/2000-01-01.md"
         content = storage.read_file(root, "daily/2000-01-01.md")
         assert "Backfilled" in content
         assert "date:" in content
 
     def test_rejects_wrong_behavior(self, root: Path) -> None:
-        with pytest.raises(RuntimeError, match="bug in tool routing"):
+        with pytest.raises(ValueError, match="requires a log section"):
             storage.edit_log(root, "me/now.md", "content")

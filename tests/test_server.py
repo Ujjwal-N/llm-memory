@@ -1,6 +1,5 @@
 """Integration tests for the MCP server tools via FastMCP Client."""
 
-import re
 from pathlib import Path
 
 import pytest
@@ -14,12 +13,11 @@ from memory_mcp.server import mcp
 def _server_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point MEMORY_DIR at a temp dir and initialize it."""
     monkeypatch.setenv("MEMORY_DIR", str(tmp_path))
-    saved = dict(storage._bootstrap)
+    saved = storage.get_sections()
     storage.apply_sections(dict(storage.DEFAULT_SECTIONS))
     storage.init_memory_dir(tmp_path)
     yield tmp_path
-    storage._bootstrap.clear()
-    storage._bootstrap.update(saved)
+    storage.apply_sections(saved)
 
 
 async def _call(client: Client, tool: str, **kwargs: object) -> object:
@@ -47,11 +45,11 @@ class TestServerTools:
                 "scan_schema",
                 "read_file",
                 "write_file",
+                "edit_file",
                 "create_directory",
                 "move_file",
                 "delete_file",
                 "add_log_entry",
-                "edit_log",
             }
             assert names == expected
 
@@ -92,12 +90,15 @@ class TestServerTools:
             )
             assert "notes.md" in str(result)
 
-    async def test_write_file_rejects_log(self, _server_root: Path) -> None:
+    async def test_write_file_log(self, _server_root: Path) -> None:
         async with Client(mcp) as client:
-            err = await _call_expect_error(
-                client, "write_file", path="daily/2026-01-01.md", content="x"
+            result = await _call(
+                client,
+                "write_file",
+                path="daily/2026-01-01.md",
+                content="# Backfilled",
             )
-            assert "log section" in err.lower() or "add_log_entry" in err
+            assert "daily/2026-01-01.md" in str(result)
 
     async def test_write_file_rejects_dir_path(self, _server_root: Path) -> None:
         async with Client(mcp) as client:
@@ -152,16 +153,55 @@ class TestServerTools:
             assert "daily/" in str(result)
             assert ".md" in str(result)
 
-    async def test_edit_log(self, _server_root: Path) -> None:
+    async def test_edit_file_tree(self, _server_root: Path) -> None:
         async with Client(mcp) as client:
-            await _call(client, "add_log_entry", section="daily", content="old content")
-            scan = await _call(client, "scan_schema", path="daily/")
-            match = re.search(r"daily/\d{4}-\d{2}-\d{2}\.md", str(scan))
-            assert match is not None
-            result = await _call(
-                client, "edit_log", path=match.group(0), content="# Replaced"
+            await _call(
+                client,
+                "write_file",
+                path="projects/notes.md",
+                content="# Notes\nOriginal content",
             )
-            assert match.group(0) in str(result)
+            result = await _call(
+                client,
+                "edit_file",
+                path="projects/notes.md",
+                old_string="Original content",
+                new_string="Edited content",
+            )
+            assert "notes.md" in str(result)
+
+    async def test_edit_file_fixed(self, _server_root: Path) -> None:
+        async with Client(mcp) as client:
+            await _call(
+                client, "write_file", path="me/now.md", content="# Now\nCurrent"
+            )
+            result = await _call(
+                client,
+                "edit_file",
+                path="me/now.md",
+                old_string="Current",
+                new_string="Updated",
+            )
+            assert "me/now.md" in str(result)
+
+    async def test_edit_file_not_found(self, _server_root: Path) -> None:
+        async with Client(mcp) as client:
+            err = await _call_expect_error(
+                client,
+                "edit_file",
+                path="projects/nope.md",
+                old_string="x",
+                new_string="y",
+            )
+            assert "not found" in err.lower()
+
+    async def test_behavior_mismatch_error(self, _server_root: Path) -> None:
+        """Wrong section type gives actionable error (e.g. create_directory on fixed)."""
+        async with Client(mcp) as client:
+            err = await _call_expect_error(
+                client, "create_directory", path="me/subdir/"
+            )
+            assert "requires a tree section" in err.lower()
 
     async def test_instructions_content(self) -> None:
         from memory_mcp.server import INSTRUCTIONS

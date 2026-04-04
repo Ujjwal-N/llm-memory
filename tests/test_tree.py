@@ -23,7 +23,7 @@ class TestCreateDirectory:
             storage.create_directory(root, "projects/acme/deep/")
 
     def test_rejects_non_tree(self, root: Path) -> None:
-        with pytest.raises(RuntimeError, match="bug in tool routing"):
+        with pytest.raises(ValueError, match="requires a tree section"):
             storage.create_directory(root, "me/subdir/")
 
     def test_rejects_file_path(self, root: Path) -> None:
@@ -86,7 +86,7 @@ class TestMoveTreeFile:
 
     def test_rejects_move_into_non_tree(self, root: Path) -> None:
         storage.write_tree_file(root, "projects/a.md", "A")
-        with pytest.raises(ValueError, match="only tree sections"):
+        with pytest.raises(ValueError, match="requires a tree section"):
             storage.move_tree_file(root, "projects/a.md", "daily/a.md")
 
     def test_move_across_dirs(self, root: Path) -> None:

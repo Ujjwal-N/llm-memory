@@ -1,10 +1,27 @@
-"""Tests for internal guard functions: _check_behavior, _check_parent_exists."""
+"""Tests for internal guard functions: get_config, _check_behavior, _check_fixed_page, _check_parent_exists."""
 
 from pathlib import Path
 
 import pytest
 
-from memory_mcp.storage import Behavior, _check_behavior, _check_parent_exists
+from memory_mcp.storage import (
+    Behavior,
+    _check_behavior,
+    _check_parent_exists,
+    _check_fixed_page,
+    get_config,
+    MemoryPath,
+)
+
+
+class TestGetConfig:
+    def test_returns_config(self) -> None:
+        config = get_config("me")
+        assert config.behavior == Behavior.FIXED
+
+    def test_raises_on_unknown_section(self) -> None:
+        with pytest.raises(ValueError, match="Unknown section"):
+            get_config("nonexistent")
 
 
 class TestCheckBehavior:
@@ -13,12 +30,30 @@ class TestCheckBehavior:
         assert config.behavior == Behavior.FIXED
 
     def test_raises_on_mismatch(self) -> None:
-        with pytest.raises(RuntimeError, match="bug in tool routing"):
+        with pytest.raises(ValueError, match="requires a tree section"):
             _check_behavior("me", Behavior.TREE)
 
     def test_raises_on_unknown_section(self) -> None:
-        with pytest.raises(RuntimeError, match="bug in tool routing"):
+        with pytest.raises(ValueError, match="Unknown section"):
             _check_behavior("nonexistent", Behavior.TREE)
+
+
+class TestCheckValidPage:
+    def test_passes_valid_page(self) -> None:
+        config = get_config("me")
+        mp = MemoryPath.parse_file("me/now.md")
+        _check_fixed_page(mp, config)
+
+    def test_rejects_invalid_page(self) -> None:
+        config = get_config("me")
+        mp = MemoryPath.parse_file("me/invalid.md")
+        with pytest.raises(ValueError, match="Invalid page"):
+            _check_fixed_page(mp, config)
+
+    def test_noop_for_tree(self) -> None:
+        config = get_config("projects")
+        mp = MemoryPath.parse_file("projects/anything.md")
+        _check_fixed_page(mp, config)
 
 
 class TestCheckParentExists:

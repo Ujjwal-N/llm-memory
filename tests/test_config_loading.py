@@ -8,9 +8,9 @@ from memory_mcp.storage import (
     Behavior,
     DEFAULT_SECTIONS,
     DirConfig,
-    _bootstrap,
     _parse_sections_json,
     apply_sections,
+    get_sections,
     load_sections,
 )
 
@@ -115,13 +115,13 @@ class TestLoadSections:
 
 
 class TestApplySections:
-    def test_replaces_bootstrap(self) -> None:
-        saved = dict(_bootstrap)
+    def test_replaces_sections(self) -> None:
+        saved = get_sections()
         try:
             custom = {"test": DirConfig(behavior=Behavior.TREE, description="test")}
             apply_sections(custom)
-            assert "test" in _bootstrap
-            assert "me" not in _bootstrap
+            current = get_sections()
+            assert "test" in current
+            assert "me" not in current
         finally:
-            _bootstrap.clear()
-            _bootstrap.update(saved)
+            apply_sections(saved)
