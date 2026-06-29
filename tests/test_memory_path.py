@@ -180,6 +180,23 @@ class TestResolve:
         with pytest.raises(ValueError, match="escapes memory directory"):
             mp.resolve_file(root)
 
+    def test_resolve_file_through_symlink_outside_root(self, root: Path) -> None:
+        external = root.parent / "external"
+        external.mkdir()
+        (external / "page.md").write_text("# Page\n")
+        (root / "projects" / "linked").symlink_to(external)
+
+        resolved = MemoryPath("projects", "linked/page.md").resolve_file(root)
+        assert resolved.read_text() == "# Page\n"
+
+    def test_resolve_dir_through_symlink_outside_root(self, root: Path) -> None:
+        external = root.parent / "external_dir"
+        external.mkdir()
+        (root / "projects" / "linked").symlink_to(external)
+
+        resolved = MemoryPath("projects", "linked", is_dir=True).resolve_dir(root)
+        assert resolved.is_dir()
+
 
 # --- roundtrip: parse() → str() ---
 

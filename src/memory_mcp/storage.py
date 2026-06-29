@@ -281,21 +281,28 @@ class MemoryPath:
             )
         return self
 
-    def resolve_file(self, root: Path) -> Path:
-        """Resolve to an absolute file path. Rejects directory paths."""
-        self.ensure_file()
-        full = (root / self.section / self.subpath).resolve()
+    def _resolve(self, root: Path) -> Path:
+        """Resolve to an absolute path under root.
+
+        Containment is checked lexically (collapsing '.'/'..' without following
+        symlinks) so that symlinked files and directories inside the memory tree
+        resolve to their targets at access time, while '..' traversal that would
+        escape the root is still rejected. root is assumed already resolved.
+        """
+        full = Path(os.path.normpath(root / self.section / self.subpath))
         if not full.is_relative_to(root):
             raise ValueError(f"Path escapes memory directory: {self}")
         return full
 
+    def resolve_file(self, root: Path) -> Path:
+        """Resolve to an absolute file path. Rejects directory paths."""
+        self.ensure_file()
+        return self._resolve(root)
+
     def resolve_dir(self, root: Path) -> Path:
         """Resolve to an absolute directory path. Rejects file paths."""
         self.ensure_dir()
-        full = (root / self.section / self.subpath).resolve()
-        if not full.is_relative_to(root):
-            raise ValueError(f"Path escapes memory directory: {self}")
-        return full
+        return self._resolve(root)
 
 
 # --- Frontmatter utilities ---
